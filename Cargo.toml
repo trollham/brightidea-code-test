@@ -1,0 +1,14 @@
+[package]
+name = "brightidea-test"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+warp = "0.3"
+futures = "0.3"
+futures-util = "0.3"
+tokio = { version= "1.0", features = ["full"] }
+tokio-stream = "0.1"
+pretty_env_logger = "0.4"
