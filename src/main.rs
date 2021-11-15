@@ -1,10 +1,24 @@
+// Start from this sample chat server https://github.com/seanmonstar/warp/blob/master/examples/websockets_chat.rs
+
+// Implement 2 new features:
+// * Add basic support for multiple chat rooms. user should only receive messages sent to the same chat room. you can use URL to identify chat rooms (e.g. ws://localhost/chat/room1)
+//      - The core functionality is to use URL to identify different chat room, sending message to the same
+//      - URL should only broadcast to other users connected to the same URL.
+//      - Some example of support to add: users don’t need to join/leave chat room, or cleanup idle chat rooms. Or anything else you can think of
+// * Write transcript of each chat room to local file. design it in a way that would be able to scale for thousands of messages per second.
+
+// Write at least 1 test.
+// Feel free to organize the code however you see fit
+
 // #![deny(warnings)]
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Weak,
 };
 
+use futures::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt, TryFutureExt};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -19,6 +33,11 @@ static NEXT_USER_ID: AtomicUsize = AtomicUsize::new(1);
 /// - Key is their id
 /// - Value is a sender of `warp::ws::Message`
 type Users = Arc<RwLock<HashMap<usize, mpsc::UnboundedSender<Message>>>>;
+type Channels = Arc<RwLock<HashMap<String, Weak<Channel>>>>;
+
+struct Channel {
+    users: Users,
+}
 
 #[tokio::main]
 async fn main() {
@@ -26,29 +45,58 @@ async fn main() {
 
     // Keep track of all connected users, key is usize, value
     // is a websocket sender.
-    let users = Users::default();
-    // Turn our "state" into a new Filter...
-    let users = warp::any().map(move || users.clone());
+    let channels = Channels::default();
+
+    let channels = warp::any().map(move || channels.clone());
 
     // GET /chat -> websocket upgrade
-    let chat = warp::path("chat")
+    let chat = warp::path!("chat" / String)
         // The `ws()` filter will prepare Websocket handshake...
         .and(warp::ws())
-        .and(users)
-        .map(|ws: warp::ws::Ws, users| {
-            // This will call our function if the handshake succeeds.
-            ws.on_upgrade(move |socket| user_connected(socket, users))
-        });
+        .and(channels)
+        .and_then(upgrade);
 
     // GET / -> index html
-    let index = warp::path::end().map(|| warp::reply::html(INDEX_HTML));
+    // let index = warp::path::end().map(|| warp::reply::html(INDEX_HTML));
+    let chat_room = warp::path!("room" / String).map(|_channel| warp::reply::html(INDEX_HTML));
 
-    let routes = index.or(chat);
+    let routes = chat_room.or(chat);
 
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
 
-async fn user_connected(ws: WebSocket, users: Users) {
+async fn upgrade(
+    channel_name: String,
+    ws: warp::ws::Ws,
+    channels: Channels,
+) -> Result<impl warp::Reply, Infallible> {
+    // This will call our function if the handshake succeeds.
+    let channel = get_channel(&channel_name, channels).await;
+    if channel.is_none() {
+        eprintln!("channel has been deleted: {}", channel_name);
+    }
+    let channel = channel.unwrap();
+    Ok(ws.on_upgrade(move |socket| user_connected(socket, channel)))
+}
+
+async fn get_channel(channel_name: &str, channels: Channels) -> Option<Arc<Channel>> {
+    if let Some(c) = channels.read().await.get(channel_name) {
+        eprintln!("channel reused: {}", channel_name);
+        return c.upgrade();
+    } 
+    let c = Arc::new(Channel {
+        users: Users::default(),
+    });
+    channels
+        .write()
+        .await
+        .insert(channel_name.to_owned(), Arc::downgrade(&c));
+    eprintln!("channel created: {}", channel_name);
+    Some(c)
+    
+}
+
+async fn user_connected(ws: WebSocket, channel: Arc<Channel>) {
     // Use a counter to assign a new unique ID for this user.
     let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -74,7 +122,7 @@ async fn user_connected(ws: WebSocket, users: Users) {
     });
 
     // Save the sender in our list of connected users.
-    users.write().await.insert(my_id, tx);
+    channel.users.write().await.insert(my_id, tx);
 
     // Return a `Future` that is basically a state machine managing
     // this specific user's connection.
@@ -89,12 +137,12 @@ async fn user_connected(ws: WebSocket, users: Users) {
                 break;
             }
         };
-        user_message(my_id, msg, &users).await;
+        user_message(my_id, msg, &channel.users).await;
     }
 
     // user_ws_rx stream will keep processing as long as the user stays
     // connected. Once they disconnect, then...
-    user_disconnected(my_id, &users).await;
+    user_disconnected(my_id, &channel.users).await;
 }
 
 async fn user_message(my_id: usize, msg: Message, users: &Users) {
@@ -141,7 +189,8 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
         <script type="text/javascript">
         const chat = document.getElementById('chat');
         const text = document.getElementById('text');
-        const uri = 'ws://' + location.host + '/chat';
+        const room_name = location.pathname.split('/');
+        const uri = 'ws://' + location.host + '/chat/' + room_name[2]; 
         const ws = new WebSocket(uri);
         function message(data) {
             const line = document.createElement('p');
