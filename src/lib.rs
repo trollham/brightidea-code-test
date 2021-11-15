@@ -1,10 +1,23 @@
-use std::{collections::HashMap, convert::Infallible, sync::{Arc, Weak, atomic::{AtomicUsize, Ordering}}};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Weak,
+    },
+};
 
 use futures::{SinkExt, StreamExt, TryFutureExt};
-use tokio::sync::{RwLock, mpsc};
+use tokio::{
+    fs::File,
+    io::{AsyncWriteExt, BufWriter},
+    sync::{
+        mpsc::{self, UnboundedSender},
+        RwLock,
+    },
+};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use warp::ws::{Message, WebSocket};
-
 
 /// Our global unique user id counter.
 static NEXT_USER_ID: AtomicUsize = AtomicUsize::new(1);
@@ -17,7 +30,63 @@ pub type Users = Arc<RwLock<HashMap<usize, mpsc::UnboundedSender<Message>>>>;
 pub type Channels = Arc<RwLock<HashMap<String, Weak<Channel>>>>;
 
 pub struct Channel {
+    name: String,
     users: Users,
+    logging_tx: mpsc::UnboundedSender<String>,
+    cancellation_tx: mpsc::UnboundedSender<()>,
+}
+
+impl Channel {
+    async fn new(name: String, users: Users) -> Channel {
+        // set up communication channels
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let mut rx = UnboundedReceiverStream::new(rx);
+        let (cancellation_tx, mut cancellation_rx) = mpsc::unbounded_channel::<()>();
+
+        let file_name = format!(
+            "{}_{}.log",
+            name,
+            humantime::format_rfc3339(std::time::SystemTime::now())
+        );
+
+        // This task handles writing to the log using a BufWriter
+        tokio::task::spawn(async move {
+            let file = File::create(file_name).await.unwrap(); // TODO error handle
+            let mut log_writer = BufWriter::new(file);
+            loop {
+                tokio::select! {
+                    Some(message) = rx.next() => {
+                        eprintln!("Writing message: {}", message);
+                        if let Err(e) = log_writer.write_all(format!("{}\n", message).as_bytes()).await {
+                            eprintln!("Error writing message: {:?}", e);
+                        }
+                    },
+                    Some(_) = cancellation_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+            log_writer.flush().await;
+        });
+
+        Channel {
+            name,
+            users,
+            logging_tx: tx,
+            cancellation_tx,
+        }
+    }
+
+    fn on_message(&mut self, msg: &str, user_id: usize) {
+        self.logging_tx.send(format!("User {}: {}", user_id, msg));
+    }
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.cancellation_tx.send(());
+        eprintln!("Channel destroyed: {}", self.name);
+    }
 }
 
 pub async fn upgrade(
@@ -27,28 +96,30 @@ pub async fn upgrade(
 ) -> Result<impl warp::Reply, Infallible> {
     // This will call our function if the handshake succeeds.
     let channel = get_channel(&channel_name, channels).await;
-    if channel.is_none() {
-        eprintln!("channel has been deleted: {}", channel_name);
-    }
-    let channel = channel.unwrap();
     Ok(ws.on_upgrade(move |socket| user_connected(socket, channel)))
 }
 
-async fn get_channel(channel_name: &str, channels: Channels) -> Option<Arc<Channel>> {
-    if let Some(c) = channels.read().await.get(channel_name) {
-        eprintln!("channel reused: {}", channel_name);
-        return c.upgrade();
-    } 
-    let c = Arc::new(Channel {
-        users: Users::default(),
-    });
-    channels
-        .write()
-        .await
-        .insert(channel_name.to_owned(), Arc::downgrade(&c));
-    eprintln!("channel created: {}", channel_name);
-    Some(c)
+async fn get_channel(channel_name: &str, channels: Channels) -> Arc<Channel> {
+    channels.write().await.retain(|_, channel_ptr| channel_ptr.strong_count() > 0); // lazily remove closed channels 
     
+    let maybe_channel = if let Some(c) = channels.read().await.get(channel_name) {
+        c.upgrade()
+    } else {None};
+    match maybe_channel {
+        Some(channel) => {
+            eprintln!("channel reused: {}", channel_name);
+            channel
+        }
+        None => {
+            let channel = Arc::new(Channel::new(channel_name.to_owned(), Users::default()).await);
+            channels
+                .write()
+                .await
+                .insert(channel_name.to_owned(), Arc::downgrade(&channel));
+            eprintln!("channel created: {}", channel_name);
+            channel
+        }
+    }
 }
 
 async fn user_connected(ws: WebSocket, channel: Arc<Channel>) {
@@ -92,7 +163,7 @@ async fn user_connected(ws: WebSocket, channel: Arc<Channel>) {
                 break;
             }
         };
-        user_message(my_id, msg, &channel.users).await;
+        user_message(my_id, msg, &channel.users, &channel.logging_tx).await;
     }
 
     // user_ws_rx stream will keep processing as long as the user stays
@@ -100,7 +171,7 @@ async fn user_connected(ws: WebSocket, channel: Arc<Channel>) {
     user_disconnected(my_id, &channel.users).await;
 }
 
-async fn user_message(my_id: usize, msg: Message, users: &Users) {
+async fn user_message(my_id: usize, msg: Message, users: &Users, logger: &UnboundedSender<String>) {
     // Skip any non-Text messages...
     let msg = if let Ok(s) = msg.to_str() {
         s
@@ -109,6 +180,7 @@ async fn user_message(my_id: usize, msg: Message, users: &Users) {
     };
 
     let new_msg = format!("<User#{}>: {}", my_id, msg);
+    logger.send(new_msg.clone());
 
     // New message from this user, send it to everyone else (except same uid)...
     for (&uid, tx) in users.read().await.iter() {
