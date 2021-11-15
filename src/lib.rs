@@ -29,9 +29,10 @@ static NEXT_USER_ID: AtomicUsize = AtomicUsize::new(1);
 pub type Users = Arc<RwLock<HashMap<usize, mpsc::UnboundedSender<Message>>>>;
 pub type Channels = Arc<RwLock<HashMap<String, Weak<Channel>>>>;
 
+#[derive(Debug)]
 pub struct Channel {
-    name: String,
-    users: Users,
+    pub name: String,
+    pub users: Users,
     logging_tx: mpsc::UnboundedSender<String>,
     cancellation_tx: mpsc::UnboundedSender<()>,
 }
@@ -89,7 +90,7 @@ impl Drop for Channel {
     }
 }
 
-pub async fn upgrade(
+pub async fn upgrade_connection(
     channel_name: String,
     ws: warp::ws::Ws,
     channels: Channels,
@@ -101,7 +102,7 @@ pub async fn upgrade(
 
 async fn get_channel(channel_name: &str, channels: Channels) -> Arc<Channel> {
     channels.write().await.retain(|_, channel_ptr| channel_ptr.strong_count() > 0); // lazily remove closed channels 
-    
+
     let maybe_channel = if let Some(c) = channels.read().await.get(channel_name) {
         c.upgrade()
     } else {None};
