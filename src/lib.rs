@@ -1,6 +1,7 @@
+pub mod api;
+
 use std::{
     collections::HashMap,
-    convert::Infallible,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
@@ -11,10 +12,7 @@ use futures::{SinkExt, StreamExt, TryFutureExt};
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
-    sync::{
-        mpsc::{self, UnboundedSender},
-        RwLock,
-    },
+    sync::{mpsc, RwLock},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use warp::ws::{Message, WebSocket};
@@ -27,18 +25,18 @@ static NEXT_USER_ID: AtomicUsize = AtomicUsize::new(1);
 /// - Key is their id
 /// - Value is a sender of `warp::ws::Message`
 pub type Users = Arc<RwLock<HashMap<usize, mpsc::UnboundedSender<Message>>>>;
-pub type Channels = Arc<RwLock<HashMap<String, Weak<Channel>>>>;
+pub type ChatRooms = Arc<RwLock<HashMap<String, Weak<ChatRoom>>>>;
 
 #[derive(Debug)]
-pub struct Channel {
+pub struct ChatRoom {
     pub name: String,
     pub users: Users,
     logging_tx: mpsc::UnboundedSender<String>,
     cancellation_tx: mpsc::UnboundedSender<()>,
 }
 
-impl Channel {
-    async fn new(name: String, users: Users) -> Channel {
+impl ChatRoom {
+    pub async fn new(name: String, users: Users) -> ChatRoom {
         // set up communication channels
         let (tx, rx) = mpsc::unbounded_channel::<String>();
         let mut rx = UnboundedReceiverStream::new(rx);
@@ -52,12 +50,11 @@ impl Channel {
 
         // This task handles writing to the log using a BufWriter
         tokio::task::spawn(async move {
-            let file = File::create(file_name).await.unwrap(); // TODO error handle
+            let file = File::create(&file_name).await.unwrap(); // TODO error handle
             let mut log_writer = BufWriter::new(file);
             loop {
                 tokio::select! {
                     Some(message) = rx.next() => {
-                        eprintln!("Writing message: {}", message);
                         if let Err(e) = log_writer.write_all(format!("{}\n", message).as_bytes()).await {
                             eprintln!("Error writing message: {:?}", e);
                         }
@@ -67,10 +64,15 @@ impl Channel {
                     }
                 }
             }
-            log_writer.flush().await;
+            if let Err(e) = log_writer.flush().await {
+                eprintln!(
+                    "Failed to write log for channel. Name: {}, Error: {}",
+                    file_name, e
+                );
+            }
         });
 
-        Channel {
+        ChatRoom {
             name,
             users,
             logging_tx: tx,
@@ -78,52 +80,62 @@ impl Channel {
         }
     }
 
-    fn on_message(&mut self, msg: &str, user_id: usize) {
-        self.logging_tx.send(format!("User {}: {}", user_id, msg));
+    pub fn log_message(&self, msg: &str, user_id: usize) {
+        if self
+            .logging_tx
+            .send(format!("Channel {}, user {}: {}", &self.name, user_id, msg))
+            .is_err()
+        {
+            eprintln!(
+                "Failed to log message. Channel: {}, user: {}, message: {}",
+                self.name, user_id, msg
+            );
+        }
+    }
+
+    pub fn broadcast(&self, msg: &str) {
+        
     }
 }
 
-impl Drop for Channel {
+impl Drop for ChatRoom {
     fn drop(&mut self) {
-        self.cancellation_tx.send(());
+        if self.cancellation_tx.send(()).is_err() {
+            eprintln!("Failed to send cancel notice to logging task, log may be incomplete. Channel: {}", self.name);
+        }
         eprintln!("Channel destroyed: {}", self.name);
     }
 }
 
-pub async fn upgrade_connection(
-    channel_name: String,
-    ws: warp::ws::Ws,
-    channels: Channels,
-) -> Result<impl warp::Reply, Infallible> {
-    // This will call our function if the handshake succeeds.
-    let channel = get_channel(&channel_name, channels).await;
-    Ok(ws.on_upgrade(move |socket| user_connected(socket, channel)))
-}
+async fn get_room(room_name: &str, rooms: ChatRooms) -> Arc<ChatRoom> {
+    rooms
+        .write()
+        .await
+        .retain(|_, room_ptr| room_ptr.strong_count() > 0); // lazily remove closed channels
 
-async fn get_channel(channel_name: &str, channels: Channels) -> Arc<Channel> {
-    channels.write().await.retain(|_, channel_ptr| channel_ptr.strong_count() > 0); // lazily remove closed channels 
-
-    let maybe_channel = if let Some(c) = channels.read().await.get(channel_name) {
+    let maybe_room = if let Some(c) = rooms.read().await.get(room_name) {
         c.upgrade()
-    } else {None};
-    match maybe_channel {
-        Some(channel) => {
-            eprintln!("channel reused: {}", channel_name);
-            channel
+    } else {
+        None
+    };
+    match maybe_room {
+        Some(room) => {
+            eprintln!("channel reused: {}", room_name);
+            room
         }
         None => {
-            let channel = Arc::new(Channel::new(channel_name.to_owned(), Users::default()).await);
-            channels
+            let room = Arc::new(ChatRoom::new(room_name.to_owned(), Users::default()).await);
+            rooms
                 .write()
                 .await
-                .insert(channel_name.to_owned(), Arc::downgrade(&channel));
-            eprintln!("channel created: {}", channel_name);
-            channel
+                .insert(room_name.to_owned(), Arc::downgrade(&room));
+            eprintln!("channel created: {}", room_name);
+            room
         }
     }
 }
 
-async fn user_connected(ws: WebSocket, channel: Arc<Channel>) {
+async fn user_connected(ws: WebSocket, room: Arc<ChatRoom>) {
     // Use a counter to assign a new unique ID for this user.
     let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -149,7 +161,7 @@ async fn user_connected(ws: WebSocket, channel: Arc<Channel>) {
     });
 
     // Save the sender in our list of connected users.
-    channel.users.write().await.insert(my_id, tx);
+    room.users.write().await.insert(my_id, tx);
 
     // Return a `Future` that is basically a state machine managing
     // this specific user's connection.
@@ -164,24 +176,27 @@ async fn user_connected(ws: WebSocket, channel: Arc<Channel>) {
                 break;
             }
         };
-        user_message(my_id, msg, &channel.users, &channel.logging_tx).await;
+        // Skip any non-Text messages, logging any errors
+        if msg.is_text() {
+            match msg.to_str() {
+                Ok(s) => {
+                    room.log_message(s, my_id);
+                    user_message(my_id, s, &room.users).await;
+                }
+                Err(_) => {
+                    room.log_message("!!!ATTEMPTED TO SEND NON-TEXT MESSAGE!!!", my_id);
+                }
+            }
+        }
     }
 
     // user_ws_rx stream will keep processing as long as the user stays
     // connected. Once they disconnect, then...
-    user_disconnected(my_id, &channel.users).await;
+    user_disconnected(my_id, &room.users).await;
 }
 
-async fn user_message(my_id: usize, msg: Message, users: &Users, logger: &UnboundedSender<String>) {
-    // Skip any non-Text messages...
-    let msg = if let Ok(s) = msg.to_str() {
-        s
-    } else {
-        return;
-    };
-
+async fn user_message(my_id: usize, msg: &str, users: &Users) {
     let new_msg = format!("<User#{}>: {}", my_id, msg);
-    logger.send(new_msg.clone());
 
     // New message from this user, send it to everyone else (except same uid)...
     for (&uid, tx) in users.read().await.iter() {
